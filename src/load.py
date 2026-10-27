@@ -1,8 +1,6 @@
 import pyodbc
-import math
+import pandas as pd
 
-
-# 🔌 CONEXIÓN
 def get_connection():
     return pyodbc.connect(
         "DRIVER={SQL Server};"
@@ -23,23 +21,11 @@ def get_unique_values(series):
     )
 
 
-# 🧮 LIMPIEZA ROBUSTA PARA NUMÉRICOS (CLAVE)
-def safe_float(value):
-    try:
-        if value is None:
-            return 0.0
-
-        if isinstance(value, str) and value.strip() == "":
-            return 0.0
-
-        val = float(value)
-
-        if math.isnan(val):
-            return 0.0
-
-        return val
-    except:
-        return 0.0
+# 🧮 NUMÉRICOS: un valor faltante se carga como NULL, nunca como 0
+def valor_o_none(value):
+    if value is None or pd.isna(value):
+        return None
+    return float(value)
 
 
 # 🍷 DIM PRODUCTO
@@ -121,7 +107,7 @@ def load_dim_cliente(df, conn):
 def load_dim_tiempo(df, conn):
     cursor = conn.cursor()
 
-    fechas = df['fecha_venta'].dropna().unique()
+    fechas = pd.to_datetime(df['fecha_venta'].dropna().unique())
 
     for f in fechas:
         fecha_id = int(f.strftime("%Y%m%d"))
@@ -135,60 +121,77 @@ def load_dim_tiempo(df, conn):
     conn.commit()
 
 
-# 📊 FACT VENTAS (VERSIÓN FINAL)
+# 📊 FACT VENTAS
 def load_fact_ventas(df, conn):
     cursor = conn.cursor()
+    insertadas = 0
+    sin_match = 0
 
-    for _, row in df.iterrows():
+    try:
+        # Vaciar la fact para que el ETL se pueda correr varias veces sin duplicar
+        cursor.execute("TRUNCATE TABLE fact_ventas")
 
-        # 🚨 SALTAR FILAS SIN FECHA
-        if row['fecha_venta'] is None or str(row['fecha_venta']) == "NaT":
-            continue
+        for _, row in df.iterrows():
+            cantidad = int(row['cantidad'])
+            precio = valor_o_none(row['precio_unitario'])
+            envio = valor_o_none(row['costo_envio'])
+            total = valor_o_none(row['total_venta'])
+            fecha_id = int(row['fecha_venta'].strftime("%Y%m%d"))
 
-        cantidad = safe_float(row['cantidad'])
-        precio = safe_float(row['precio_unitario'])
-        envio = safe_float(row['costo_envio'])
-
-        fecha_id = int(row['fecha_venta'].strftime("%Y%m%d"))
-
-        cursor.execute("""
-            INSERT INTO fact_ventas (
-                producto_id,
-                provincia_id,
-                metodo_pago_id,
-                vendedor_id,
-                cliente_id,
-                fecha_id,
-                cantidad,
-                precio_unitario,
-                costo_envio
+            cursor.execute("""
+                INSERT INTO fact_ventas (
+                    producto_id,
+                    provincia_id,
+                    metodo_pago_id,
+                    vendedor_id,
+                    cliente_id,
+                    fecha_id,
+                    cantidad,
+                    precio_unitario,
+                    costo_envio,
+                    total_venta
+                )
+                SELECT
+                    dp.producto_id,
+                    dpr.provincia_id,
+                    dmp.metodo_pago_id,
+                    dv.vendedor_id,
+                    dc.cliente_id,
+                    dt.fecha_id,
+                    ?, ?, ?, ?
+                FROM dim_producto dp
+                JOIN dim_provincia dpr ON dpr.nombre_provincia = ?
+                JOIN dim_metodo_pago dmp ON dmp.descripcion = ?
+                JOIN dim_vendedor dv ON dv.nombre_vendedor = ?
+                JOIN dim_cliente dc ON dc.cliente_id = ?
+                JOIN dim_tiempo dt ON dt.fecha_id = ?
+                WHERE dp.nombre_producto = ?
+            """,
+            cantidad,
+            precio,
+            envio,
+            total,
+            str(row['provincia']).strip(),
+            str(row['metodo_pago']).strip(),
+            str(row['vendedor']).strip(),
+            str(row['cliente_id']).strip(),
+            fecha_id,
+            str(row['producto']).strip()
             )
-            SELECT
-                dp.producto_id,
-                dpr.provincia_id,
-                dmp.metodo_pago_id,
-                dv.vendedor_id,
-                dc.cliente_id,
-                dt.fecha_id,
-                ?, ?, ?
-            FROM dim_producto dp
-            JOIN dim_provincia dpr ON dpr.nombre_provincia = ?
-            JOIN dim_metodo_pago dmp ON dmp.descripcion = ?
-            JOIN dim_vendedor dv ON dv.nombre_vendedor = ?
-            JOIN dim_cliente dc ON dc.cliente_id = ?
-            JOIN dim_tiempo dt ON dt.fecha_id = ?
-            WHERE dp.nombre_producto = ?
-        """,
-        cantidad,
-        precio,
-        envio,
-        str(row['provincia']).strip(),
-        str(row['metodo_pago']).strip(),
-        str(row['vendedor']).strip(),
-        str(row['cliente_id']).strip(),
-        fecha_id,
-        str(row['producto']).strip()
-        )
 
-    conn.commit()
-    print("✅ Fact table cargada")
+            # Si el JOIN no encontró alguna dimensión, no se inserta nada: lo contamos
+            if cursor.rowcount == 1:
+                insertadas += 1
+            else:
+                sin_match += 1
+
+        conn.commit()
+
+    except Exception:
+        conn.rollback()
+        print("❌ Error durante la carga. Se deshizo todo (rollback).")
+        raise
+
+    print(f"✅ Fact table cargada: {insertadas} filas insertadas")
+    if sin_match:
+        print(f"⚠️ {sin_match} filas no se insertaron (no coincidieron con alguna dimensión)")
